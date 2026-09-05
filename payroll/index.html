@@ -467,6 +467,39 @@ function shiftISO(iso, days){
   const d=new Date(+p[0], +p[1]-1, +p[2], 12, 0, 0); d.setDate(d.getDate()+days);
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
+// (v2026-09-05) dateVariants(iso) — every plausible stored-text shape of one ISO date, for an
+// EXACT-MATCH filter against the TEXT `date` column — already exists below (attendance_time_edit's
+// query needs the exact same thing: mixed 'YYYY-MM-DD'/'M/D/YYYY'-shaped rows, and a gte/lte range
+// filter can't be trusted on the MM/DD/YYYY shape, which doesn't sort chronologically as a string).
+// Reused here rather than redefined. dateRangeVariants() below just calls it once per day in range.
+function dateRangeVariants(fromISO,toISO_){
+  const out=[]; let d=fromISO;
+  while(d<=toISO_){ out.push(...dateVariants(d)); d=shiftISO(d,1); }
+  return out;
+}
+// (v2026-09-05) BUG FIXED HERE: attendance used to be fetched as the most-recent-5000-by-created_at
+// rows (silently capped at 1000 server-side regardless of the requested .limit() — confirmed live),
+// then filtered client-side to the pay week. Once the table grew past that cap, any week whose rows
+// were old enough BY INSERTION TIME fell outside the fetched batch entirely and reported "No
+// attendance found" despite the real data existing (confirmed for 2026-07-11..17: 152 real rows, 0
+// ever fetched). Filtering by the actual date column server-side removes the row-count cap from the
+// picture — the database decides what's in range, not an arbitrary insertion-order window — but a
+// single request can still only return up to that same 1000-row cap, so this paginates with .range()
+// past it, however large the matched set grows.
+async function fetchAttendanceByDate(variants, withOrder){
+  const PAGE=1000;
+  let all=[], page=0;
+  for(;;){
+    let q=sb.from('attendance_records').select('*').in('date',variants);
+    if(withOrder) q=q.order('created_at',{ascending:false});
+    const res=await q.range(page*PAGE,(page+1)*PAGE-1);
+    if(res.error) return res;
+    const rows=res.data||[];
+    all=all.concat(rows);
+    if(rows.length<PAGE) return {data:all, error:null};
+    page++;
+  }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
 //  HOLIDAYS  (spec: docs/superpowers/specs/2026-08-12-holiday-pay.md)
@@ -1006,20 +1039,28 @@ async function runPayroll(){
     await loadAdvances();
     await loadLeaves();
     await loadHolidays();
-    // Fetch attendance. The kiosk stores `date` as TEXT in mixed formats
-    // (ISO '2026-06-29' and MM/DD/YYYY '06/29/2026'). A Supabase gte/lte range
-    // filter compares those as plain strings and silently drops the non-ISO
-    // rows — which is what was hiding most clocked-in workers (e.g. 2 of 16).
-    // So pull recent rows and filter client-side on a NORMALISED ISO date,
-    // exactly like the Today tab, so the two screens can never disagree.
+    // Fetch attendance. The kiosk stores `date` as TEXT in mixed formats (ISO '2026-06-29',
+    // 'MM/DD/YYYY' '06/29/2026', and un-padded '6/29/2026' on older rows — see toISO()/dateVariants()
+    // above). Filtered server-side via an exact-match list of every stored-text shape for every day
+    // in range (dateRangeVariants), paginated past the server's row cap (fetchAttendanceByDate) — see
+    // the v2026-09-05 note on fetchAttendanceByDate for why the previous fixed-batch-then-filter
+    // approach silently dropped real data once the table grew past 1000 rows.
+    //
+    // The query range is extended BACKWARD by PR_HOL_LOOKBACK_DAYS (currently 14 days before `from`)
+    // so qualifyingDayFor()'s backward walk (a Monday holiday qualifies against the previous Saturday,
+    // sometimes further back over a shutdown) still has real attendance to check against —
+    // _yardRan/_workedByCode are built from this full EXTENDED fetch, exactly as before; only `recs`
+    // itself (what actually gets paid) is narrowed to [from, to].
     let recs=[], fetchedN=0;
     try{
-      let res=await sb.from('attendance_records').select('*').order('created_at',{ascending:false}).limit(5000);
-      if(res.error){ res=await sb.from('attendance_records').select('*').limit(5000); } // table may lack created_at
+      const queryFrom=shiftISO(from,-PR_HOL_LOOKBACK_DAYS);
+      const variants=dateRangeVariants(queryFrom,to);
+      let res=await fetchAttendanceByDate(variants,true);
+      if(res.error){ res=await fetchAttendanceByDate(variants,false); } // table may lack created_at
       if(res.error) throw res.error;
       fetchedN=(res.data||[]).length;
       // BEFORE narrowing to the pay week: build the two indexes holiday qualification needs, from
-      // the FULL fetch. The qualifying day is routinely outside the week — a Monday holiday
+      // the FULL (extended) fetch. The qualifying day is routinely outside the week — a Monday holiday
       // qualifies against the previous Saturday — so anything built from `recs` would be blind to
       // it and would fail every worker on a week-opening holiday.
       _yardRan=new Set(); _workedByCode={};
